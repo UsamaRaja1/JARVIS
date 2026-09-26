@@ -1,0 +1,49 @@
+{
+  "prices": {
+    "anthropic.claude-3-sonnet-20240229-v1:0anthropic.claude-3-sonnet-20240229-v1:0": {
+      "input": 0.000003,
+      "output": 0.000015
+    },
+    "gpt-3.5-turbo-0125": {
+      "input": 0.0000005,
+      "output": 0.0000015
+    },
+    "gpt-4-0125-preview": {
+      "input": 0.00001,
+      "output": 0.00003
+    },
+    "gpt-4o": {
+      "input": 0.0000025,
+      "output": 0.00001
+    },
+    "gpt-4o-mini": {
+      "input": 0.00000015,
+      "output": 0.0000006
+    },
+    "llama3.1-8b": {
+      "input": 0.0000001,
+      "output": 0.0000001,
+      "total": null
+    },
+    "llama3.1-70b": {
+      "input": 0.00000085,
+      "output": 0.0000012,
+      "total": null
+    },
+    "llama3.3-70b": {
+      "input": 0.00000085,
+      "output": 0.0000012,
+      "total": null
+    },
+    "text-embedding-3-large": {
+      "total": 0.00000013
+    },
+    "bge-runpod": {
+      "total": 0.00031
+    },
+    "gemini-1.5-pro-preview-0409": {
+      "input_token_lte_128k": 0.00032875,
+      "input_token_gt_128k": 0.0006575
+    }
+  }
+}

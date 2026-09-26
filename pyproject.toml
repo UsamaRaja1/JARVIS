@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-voice-assistant"
+version = "0.0.1"
+description = "A Linux-focused voice assistant with desktop, vision, and hardware integrations."
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["*"]
+exclude = ["logs*", "docs*", "data*", 'notebook*']  # Exclude non-package directories
+
+# Black configuration
+[tool.black]
+line-length = 200
+target-version = ["py311"]
+skip-string-normalization = true
+
+# Ruff configuration
+[tool.ruff]
+line-length = 200
+target-version = "py311"
+
+fix = false
+unsafe-fixes = false
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E402", "E501", "F821", "SIM113", 'E722', 'E741', 'B007']
+
+[tool.ruff.lint.isort]
+known-first-party = ["Jarvis"]
+known-third-party = [
+    "PIL", "aiohttp", "bs4", "dependency_injector", "distutils", "dotenv", "faker", "flask", "flask_cors",
+    "httpx", "json_repair", "loguru", "matplotlib", "networkx", "openai", "playwright", "pydantic",
+     "requests", "rich", "tiktoken", "torch", "transformers", "typing_extensions", "xmldiff"
+]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# Optional: A section for development dependencies
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=4,<5",
+    "pytest>=8,<9",
+    "ruff>=0.10,<1"
+]

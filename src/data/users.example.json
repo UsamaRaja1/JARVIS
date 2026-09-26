@@ -1,0 +1,10 @@
+{
+  "alexexample": {
+    "name": "Alex Example",
+    "workspace": {
+      "brightness": 60,
+      "volume": 50,
+      "favorite_apps": ["terminal", "browser"]
+    }
+  }
+}
