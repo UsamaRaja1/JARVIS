@@ -2,7 +2,7 @@
 
 **Voice, Vision & Automation**
 
-JARVIS is an experimental, Linux-focused personal assistant that combines voice
+JARVIS is an experimental, cross-platform personal assistant that combines voice
 interaction, local desktop automation, face and voice recognition, optional LLM
 providers, and optional Arduino/Blynk hardware control.
 
@@ -17,53 +17,65 @@ providers, and optional Arduino/Blynk hardware control.
 - OpenAI, OpenRouter, Groq, and Gemini provider routing
 - Face detection and recognition with locally generated encodings
 - Optional voice recognition using pyannote
-- Linux desktop, media, brightness, and application controls
+- Desktop, media, volume, brightness, and application controls
 - Optional Arduino and Blynk smart-device control
 - A stdio Model Context Protocol (MCP) server
 
-Most hardware and recognition features are optional. The project is currently
-developed and tested primarily on Ubuntu with Python 3.11.
+Most hardware and recognition features are optional. The project is developed
+primarily on Ubuntu with Python 3.11. Windows supports the core voice, vision,
+media-key, volume, and serial features; Linux-only desktop features are identified
+below.
 
 ## Quick start
 
-### 1. Install system packages
+### Ubuntu/Debian
 
-On Ubuntu/Debian:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake espeak-ng ffmpeg libasound2-dev \
-  libboost-all-dev libopenblas-dev liblapack-dev libsndfile1 portaudio19-dev \
-  python3.11 python3.11-dev python3.11-venv playerctl wmctrl xdotool brightnessctl
-```
-
-Some desktop tools may require additional permissions. Camera, microphone, and
-Arduino features require the corresponding hardware.
-
-### 2. Create the Python environment
+Clone the repository and run the Linux setup script:
 
 ```bash
 git clone https://github.com/UsamaRaja1/JARVIS.git
 cd JARVIS
-python3.11 -m venv .venv
+./scripts/setup.sh
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
 ```
 
-The full voice/vision stack is large and includes PyTorch, MediaPipe, dlib, and
-audio-system dependencies. Installation can take several minutes.
+The script installs the required Debian packages, creates or reuses `.venv`,
+installs the Python dependencies, and creates `.env` from `.env.template` when
+needed.
 
-### 3. Configure providers
+### Windows
 
-```bash
-cp .env.template .env
+Install these prerequisites first:
+
+- [Python 3.11](https://www.python.org/downloads/) with the Python launcher
+- [Git for Windows](https://git-scm.com/download/win)
+- Microsoft C++ Build Tools with the **Desktop development with C++** workload
+- CMake and FFmpeg available on `PATH`
+
+Then open PowerShell or Command Prompt:
+
+```powershell
+git clone https://github.com/UsamaRaja1/JARVIS.git
+cd JARVIS
+scripts\setup-windows.bat
 ```
 
-Edit `.env` and provide at least one supported LLM API key. Never commit `.env`.
-Hardware, Notion, Hugging Face, and computer-unlock settings are optional.
+Alternatively, invoke the PowerShell installer directly:
 
-### 4. Run Jarvis
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1
+```
+
+Activate the environment with `.\.venv\Scripts\Activate.ps1`, or run JARVIS
+directly with `.\.venv\Scripts\python.exe -m src.jarvis_v2`.
+
+### Configure providers
+
+The setup scripts create `.env` from `.env.template` only when it does not already
+exist. Edit `.env` and provide at least one supported LLM API key. Never commit
+`.env`. Hardware, Notion, Hugging Face, and computer-unlock settings are optional.
+
+### Run JARVIS
 
 From the repository root:
 
@@ -76,6 +88,17 @@ For long-running Linux deployments using Conda and PM2:
 ```bash
 ./scripts/deploy.sh start
 ```
+
+### Current platform limitations
+
+- Window enumeration, window focusing, virtual-desktop switching, and brightness
+  control currently rely on Linux utilities such as `wmctrl`, `xdotool`, and
+  `brightnessctl`.
+- Camera and microphone device selection can vary by Windows driver.
+- `face-recognition` may require CMake and the Microsoft C++ Build Tools to build
+  its `dlib` dependency on Windows.
+- Some optional speech and vision models are downloaded on first use and can be
+  several gigabytes.
 
 ## Face-recognition setup
 
