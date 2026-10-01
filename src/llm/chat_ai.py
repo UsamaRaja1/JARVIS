@@ -47,7 +47,7 @@ class ChatAI:
                 return response
 
             if len(self.messages) > 10:
-                self.messages = [self.messages[0]] + self.messages[-10:]
+                self.messages = [self.messages[0], *self.messages[-10:]]
 
             base64_image = None
             if image_path:
