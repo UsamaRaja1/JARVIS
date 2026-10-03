@@ -92,7 +92,11 @@ async def jarvis(arduino=None, face_recognizer=None):
                         if cap:
                             face_recognizer.run(True, cap=cap, camera_control_queue=face_recognizer.camera_control_queue)
                             if face_recognizer.is_running:
-                                rc_car.start_controls(camera_target_queue=face_recognizer.camera_control_queue, stop_event=face_recognizer.stop_event)
+                                rc_car.start_controls(
+                                    camera_target_queue=face_recognizer.camera_control_queue,
+                                    stop_event=face_recognizer.stop_event,
+                                    telemetry_queue=face_recognizer.telemetry_queue,
+                                )
                                 assistant.say("WiFi camera connected. Face tracking and car controls are active.")
                             else:
                                 rc_car.stop()

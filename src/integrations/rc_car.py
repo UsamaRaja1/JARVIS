@@ -1,7 +1,8 @@
+import contextlib
 import re
 import threading
 import time
-from queue import Empty
+from queue import Empty, Full
 
 import cv2
 import numpy as np
@@ -34,6 +35,7 @@ class RCCarController:
         self.serial_thread = None
         self.control_thread = None
         self.camera_target_queue = None
+        self.telemetry_queue = None
         self.camera_tracking = False
         self._control_stop_event = None
 
@@ -58,11 +60,12 @@ class RCCarController:
         self.serial_thread = threading.Thread(target=self._serial_reader, daemon=True)
         self.serial_thread.start()
 
-    def start_controls(self, camera_target_queue=None, keyboard_control: bool = True, stop_event=None):
+    def start_controls(self, camera_target_queue=None, keyboard_control: bool = True, stop_event=None, telemetry_queue=None):
         """Start the single RC output loop and, optionally, keyboard input."""
         if camera_target_queue is not None:
             self.camera_target_queue = camera_target_queue
             self.camera_tracking = True
+        self.telemetry_queue = telemetry_queue
         self._control_stop_event = stop_event
         if self._controls_running.is_set():
             return
@@ -115,11 +118,23 @@ class RCCarController:
 
                 with self.response_lock:
                     self.latest_response = parsed
+                self._publish_telemetry(parsed)
                 self.response_event.set()
 
             except Exception as e:
                 logger_.error("Serial read error: %s", e)
                 time.sleep(0.05)
+
+    def _publish_telemetry(self, data):
+        if self.telemetry_queue is None:
+            return
+        try:
+            self.telemetry_queue.put_nowait(data)
+        except Full:
+            with contextlib.suppress(Empty):
+                self.telemetry_queue.get_nowait()
+            with contextlib.suppress(Full):
+                self.telemetry_queue.put_nowait(data)
 
     # -------------------------
     # CONTROL LOOP (50 Hz)

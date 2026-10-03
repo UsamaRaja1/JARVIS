@@ -38,10 +38,11 @@ def get_face_detector_model_path():
 
 class FaceRecognitionSystem:
     def __init__(self, arduino=None, images_dir=None, encoding_dir=None):
-        self.min_x = 0
-        self.max_x = 255
+        # Keep tracking and searching away from the camera mount's hard stops.
+        self.min_x = 35
+        self.max_x = 220
         self.min_y = 0
-        self.max_y = 255
+        self.max_y = 200
         self.font_scale = 0.5
         self.thickness = 2
         self.color = {"blue": (255, 0, 0), "green": (0, 255, 0), "red": (0, 0, 255), "white": (255, 255, 255)}
@@ -61,7 +62,18 @@ class FaceRecognitionSystem:
         self.detection_process = None
         self.stop_event = multiprocessing.Event()  # Event to signal stop
         self.camera_control_queue = multiprocessing.Queue(maxsize=1)
+        self.telemetry_queue = multiprocessing.Queue(maxsize=1)
         self.is_running = False
+
+    @staticmethod
+    def _move_toward(current, target, step=3):
+        if abs(target - current) <= step:
+            return target
+        return current + step if target > current else current - step
+
+    @staticmethod
+    def _nearest_position_index(positions, x, y):
+        return min(range(len(positions)), key=lambda i: (positions[i][0] - x) ** 2 + (positions[i][1] - y) ** 2)
 
     def _create_worker_queues(self):
         self.detection_queue = multiprocessing.Queue()
@@ -77,28 +89,19 @@ class FaceRecognitionSystem:
 
     def recognize_faces_in_frame(self, data, arduino_controller, print_logs=False, threshold=0.55):
         face_location = data["face_locations"]
-        x_axis = data.get("x_axis")
-        y_axis = data.get("y_axis")
         names = []
-        coordinates = []
         t = time.time()
 
         if face_location:
             person_encodings = fr.face_encodings(data["frame"], face_location)
-            for i, _face_loc in enumerate(face_location):
-                result = fr.compare_faces(self.encoded_images, person_encodings[i], tolerance=threshold)
-                if True in result:
-                    for j, val in enumerate(result):
-                        if val:
-                            name = self.images["names"][j]
-                            names.append(name)
-                            coordinates.append({name: {"x_axis": x_axis, "y_axis": y_axis}})
-                    arduino_controller.lights_control({"green": 10, "red": 0})
-                else:
-                    name = "Unknown"
-                    names.append(name)
-                    coordinates.append({name: {"x_axis": None, "y_axis": None}})
-                    arduino_controller.lights_control({"green": 0, "red": 10})
+            for person_encoding in person_encodings:
+                distances = fr.face_distance(self.encoded_images, person_encoding)
+                best_index = distances.argmin() if len(distances) else None
+                names.append(self.images["names"][best_index] if best_index is not None and distances[best_index] <= threshold else "Unknown")
+
+            known_face = any(name != "Unknown" for name in names)
+            arduino_controller.lights_control({"green": 10 if known_face else 0, "red": 0 if known_face else 10})
+            face_location = face_location[: len(names)]
 
         if print_logs:
             logger_.info(f"Face recognition time: {(time.time() - t):.3f} sec")
@@ -163,11 +166,20 @@ class FaceRecognitionSystem:
 
         prev_time = time.time()
         print_logs = False
-        kx = 0
-        ky = 0
         names = []
-        face_locations = []
         flip = False
+        scan_positions = (
+            (127, 80),
+            (75, 80),
+            (180, 80),
+            (127, 120),
+            (75, 120),
+            (180, 120),
+        )
+        scan_index = 0
+        scan_hold_until = 0.0
+        was_tracking = False
+        telemetry = {}
 
         recognition_queue = self.queues["recognition_queue"]
         detection_queue = self.queues["detection_queue"]
@@ -197,13 +209,12 @@ class FaceRecognitionSystem:
                 if not recognition_queue.empty():
                     json_data = recognition_queue.get()
                     names = json_data.get("names")
-                    face_locations = json_data.get("face_locations")
 
-                if face_locations:
-                    for i, face_loc in enumerate(face_locations):
-                        y1, x2, y2, x1 = face_loc
-                        y1, x2, y2, x1 = int(y1 / resize), int(x2 / resize), int(y2 / resize), int(x1 / resize)
-                        cv2.putText(frame, names[i], (x1, y1 - 30), cv2.FONT_HERSHEY_COMPLEX, self.font_scale, self.color["green"], self.thickness)
+                try:
+                    while True:
+                        telemetry = self.telemetry_queue.get_nowait()
+                except Empty:
+                    pass
 
                 t1 = time.time()
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -212,6 +223,7 @@ class FaceRecognitionSystem:
                     logger_.info(f"Face detection time: {(time.time() - t1):.3f} sec")
 
                 if results.detections:
+                    was_tracking = True
                     for i, detection in enumerate(results.detections):
                         score = detection.categories[0].score
                         bbox = detection.bounding_box
@@ -219,9 +231,13 @@ class FaceRecognitionSystem:
                         x2, y2 = x1 + bbox.width, y1 + bbox.height
                         facelocations.append([y1, x2, y2, x1])
 
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), self.color["green"], 1)
-                        cv2.putText(frame, f"score: {(score):.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_COMPLEX, self.font_scale, self.color["green"], self.thickness)
-                        cv2.putText(frame, f"FPS: {int(fps)}", (5, 25), cv2.FONT_HERSHEY_COMPLEX, self.font_scale, self.color["green"], self.thickness)
+                        label = names[i] if len(names) == len(results.detections) else "Analyzing..."
+                        label = f"{label}  {score:.0%}"
+                        (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, 1)
+                        label_y = max(label_height + 8, y1)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), self.color["green"], 2)
+                        cv2.rectangle(frame, (x1, label_y - label_height - 8), (x1 + label_width + 12, label_y), (20, 20, 20), -1)
+                        cv2.putText(frame, label, (x1 + 6, label_y - 5), cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, self.color["white"], 1, cv2.LINE_AA)
 
                         x_min = min(x_min, x1)
                         y_min = min(y_min, y1)
@@ -258,42 +274,25 @@ class FaceRecognitionSystem:
                     if recv:
                         print(recv)
                     if score > 0.63:
-                        kx = 0 if diff_x > 0 else 1
-                        ky = 1 if diff_y > 0 else 0
-
+                        scan_hold_until = 0.0
                         if detection_queue.empty():
                             detection_queue.put({"frame": frame, "face_locations": facelocations, "x_axis": x_axis, "y_axis": y_axis})
 
                 else:
-                    steps = 3
-                    if kx == 0:
-                        x_axis += steps
-                        if x_axis >= self.max_x:
-                            x_axis = self.max_x
-                            kx = 1
-                    else:
-                        x_axis -= steps
-                        if x_axis <= self.min_x:
-                            x_axis = self.min_x
-                            kx = 0
-
-                    if score > 0.6:
-                        if ky == 0:
-                            y_axis += steps
-                            if y_axis >= self.max_y:
-                                y_axis = self.max_y
-                                ky = 1
-                        else:
-                            y_axis -= steps
-                            if y_axis <= self.min_y:
-                                y_axis = self.min_y
-                                ky = 0
-                    p = 0.9
-                    if p != 1:
-                        x_axis = int(px * (1 - p) + x_axis * p)
-                        y_axis = int(py * (1 - p) + y_axis * p)
-
-                    # logger.info(f"px {px}, py {py} |  x {x_axis}, y {y_axis}  |  prev-x {self.prev_x}, prev-y {self.prev_y}")
+                    if was_tracking:
+                        scan_index = self._nearest_position_index(scan_positions, x_axis, y_axis)
+                        scan_hold_until = 0.0
+                        was_tracking = False
+                    target_x, target_y = scan_positions[scan_index]
+                    print(target_x, target_y)
+                    x_axis = self._move_toward(x_axis, target_x)
+                    y_axis = self._move_toward(y_axis, target_y)
+                    if (x_axis, y_axis) == (target_x, target_y):
+                        if not scan_hold_until:
+                            scan_hold_until = time.monotonic() + 0.7
+                        elif time.monotonic() >= scan_hold_until:
+                            scan_index = (scan_index + 1) % len(scan_positions)
+                            scan_hold_until = 0.0
 
                     x_axis = min(self.max_x, max(self.min_x, x_axis))
                     y_axis = min(self.max_y, max(self.min_y, y_axis))
@@ -305,6 +304,12 @@ class FaceRecognitionSystem:
                         self._send_camera_target(camera_control_queue, target_x, target_y)
                     else:
                         self.arduino_controller.send_payload(X1=target_x, Y2=target_y, AUX6=1)
+
+                rc_data = f"  |  RC DATA: {telemetry['message']}" if telemetry.get("message") else ""
+                status = f"FPS {int(fps)}  |  {'TRACKING' if results.detections else 'SEARCHING'}{rc_data}"
+                (status_width, _), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(frame, (8, 8), (status_width + 24, 36), (20, 20, 20), -1)
+                cv2.putText(frame, status, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.color["white"], 1, cv2.LINE_AA)
 
                 if not self.current_frame_queue.empty():
                     self.current_frame_queue.get_nowait()  # Remove the old frame
