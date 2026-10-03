@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import getpass
 import os
 import queue
@@ -36,6 +37,7 @@ class VoiceAssistant:
         self.arduino = arduino
         self.vad_iterator = VADIterator(model=model)
         self.audio_queue = queue.Queue(maxsize=150)
+        self.utterance_queue = queue.Queue(maxsize=10)
         self.stop_event = threading.Event()
         self.kb_listener = KeyboardListener()
         self.state_lock = threading.Lock()
@@ -231,7 +233,6 @@ class VoiceAssistant:
 
                     if not self.recording_started and not self.is_speaking:
                         self.recording_started = True
-                        self.speech_committed = False
                         st = time.time()
                         t2 = time.time()
 
@@ -245,13 +246,14 @@ class VoiceAssistant:
                         if len(audio_data) > 30:
                             logger_.info("speech_committed")
                             self.audio_data = self.convert_to_audio(audio_data)
-                            self.speech_committed = True
                             self.is_bot_speaking()
+                            self._queue_utterance(self.audio_data.copy(), self.user_name)
                         self.recording_started = False
                         speech_detected = False
 
     def _reset_audio_state(self):
         self.audio_queue = queue.Queue(maxsize=200)
+        self.utterance_queue = queue.Queue(maxsize=10)
         self.audio_data = []
         self.data = []
         self.text = ""
@@ -263,6 +265,31 @@ class VoiceAssistant:
         self.is_bot = False
         self.vad_last_time = time.time()
         self.vad_iterator = VADIterator(model=self.model)
+
+    def _queue_utterance(self, audio_data, user_name):
+        """Keep complete recordings until the command loop can transcribe them."""
+        try:
+            self.utterance_queue.put_nowait((audio_data, user_name))
+        except queue.Full:
+            # Keep current speech responsive if the consumer was blocked for a long time.
+            with contextlib.suppress(queue.Empty):
+                self.utterance_queue.get_nowait()
+            try:
+                self.utterance_queue.put_nowait((audio_data, user_name))
+            except queue.Full:
+                logger_.warning("Transcription queue remained full; dropped the newest utterance")
+                return
+            logger_.warning("Transcription queue was full; dropped the oldest utterance")
+        self.speech_committed = True
+
+    def get_committed_utterance(self):
+        try:
+            utterance = self.utterance_queue.get_nowait()
+        except queue.Empty:
+            self.speech_committed = False
+            return None
+        self.speech_committed = not self.utterance_queue.empty()
+        return utterance
 
     def _stop_background_threads(self, stop_keyboard=False):
         self.listening = False
@@ -380,11 +407,13 @@ class VoiceAssistant:
     # ─────────────────────────────────────────────────────────────
     # 5. Transcription & TTS
     # ─────────────────────────────────────────────────────────────
-    async def transcribe_audio(self, callback, repeat_speech, offline_stt=False):
+    async def transcribe_audio(self, callback, repeat_speech, offline_stt=False, audio_data=None, user_name=None):
         try:
-            self.text = self._listen(audio=self.audio_data.copy(), offline_stt=offline_stt)
+            audio_data = self.audio_data.copy() if audio_data is None else audio_data
+            self.text = await asyncio.wait_for(asyncio.to_thread(self._listen, audio=audio_data, offline_stt=offline_stt), timeout=15)
             if self.text:
-                logger_.info(f"User [{self.user_name}]: {self.text}" if self.user_name else f"User: {self.text}")
+                speaker = self.user_name if user_name is None else user_name
+                logger_.info(f"User [{speaker}]: {self.text}" if speaker else f"User: {self.text}")
                 if len(self.messages) == 0 or self.messages[-1]["role"] != "user":
                     self.messages.append({"role": "user", "content": self.text})
                 else:
@@ -401,6 +430,8 @@ class VoiceAssistant:
 
         except asyncio.CancelledError:
             logger_.info("Transcription task was interrupted and canceled.")
+        except TimeoutError:
+            logger_.error("Transcription timed out after 15 seconds")
         except Exception as e:
             logger_.error(f"Error occurred while transcribing audio: {e}")
 

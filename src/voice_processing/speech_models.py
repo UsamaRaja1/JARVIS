@@ -59,6 +59,7 @@ def get_whisper_pipeline():
 
 def listen(timeout=5, audio=None, offline_stt=False):
     recognizer = sr.Recognizer()
+    recognizer.operation_timeout = 10
 
     if audio is None:
         with sr.Microphone() as source:

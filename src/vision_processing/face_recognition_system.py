@@ -1,7 +1,9 @@
+import contextlib
 import multiprocessing
 import os
 import time
 from pathlib import Path
+from queue import Empty, Full
 from urllib.request import urlretrieve
 
 import cv2
@@ -51,13 +53,27 @@ class FaceRecognitionSystem:
         self.person_data = {}
         self.current_frame_queue = multiprocessing.Queue(maxsize=1)
         self.arduino_controller = arduino if arduino else ArduinoController()
-        self.detection_queue = multiprocessing.Queue()
-        self.recognition_queue = multiprocessing.Queue()
-        self.queues = {"detection_queue": self.detection_queue, "recognition_queue": self.recognition_queue}
+        self.detection_queue = None
+        self.recognition_queue = None
+        self.queues = {}
+        self._create_worker_queues()
         self.recognition_process = None
         self.detection_process = None
         self.stop_event = multiprocessing.Event()  # Event to signal stop
+        self.camera_control_queue = multiprocessing.Queue(maxsize=1)
         self.is_running = False
+
+    def _create_worker_queues(self):
+        self.detection_queue = multiprocessing.Queue()
+        self.recognition_queue = multiprocessing.Queue()
+        self.queues = {"detection_queue": self.detection_queue, "recognition_queue": self.recognition_queue}
+
+    def _clear_camera_targets(self):
+        while True:
+            try:
+                self.camera_control_queue.get_nowait()
+            except Empty:
+                return
 
     def recognize_faces_in_frame(self, data, arduino_controller, print_logs=False, threshold=0.55):
         face_location = data["face_locations"]
@@ -104,7 +120,18 @@ class FaceRecognitionSystem:
             faceLocations, names = self.recognize_faces_in_frame(data, arduino_controller)
             recognition_queue.put({"face_locations": faceLocations, "names": names})
 
-    def face_detection(self, cap: cv2.VideoCapture = None):
+    @staticmethod
+    def _send_camera_target(camera_control_queue, x, y):
+        """Publish only the newest target so tracking never blocks on stale frames."""
+        try:
+            camera_control_queue.put_nowait((x, y))
+        except Full:
+            with contextlib.suppress(Empty):
+                camera_control_queue.get_nowait()
+            with contextlib.suppress(Full):
+                camera_control_queue.put_nowait((x, y))
+
+    def face_detection(self, cap: cv2.VideoCapture = None, camera_control_queue=None):
         resize = 1
         if cap is None:
             cap = get_video_capture()
@@ -127,6 +154,13 @@ class FaceRecognitionSystem:
         x_axis, y_axis = 127, 127
         px, py = x_axis, y_axis
 
+        detector_options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=get_face_detector_model_path()),
+            running_mode=mp.tasks.vision.RunningMode.VIDEO,
+            min_detection_confidence=0.5,
+        )
+        face_detector = mp.tasks.vision.FaceDetector.create_from_options(detector_options)
+
         prev_time = time.time()
         print_logs = False
         kx = 0
@@ -137,16 +171,9 @@ class FaceRecognitionSystem:
 
         recognition_queue = self.queues["recognition_queue"]
         detection_queue = self.queues["detection_queue"]
-        face_detector = None
 
         try:
-            options = mp.tasks.vision.FaceDetectorOptions(
-                base_options=mp.tasks.BaseOptions(model_asset_path=get_face_detector_model_path()),
-                min_detection_confidence=0.5,
-            )
-            face_detector = mp.tasks.vision.FaceDetector.create_from_options(options)
-
-            while cap.isOpened() or self.stop_event.is_set():
+            while cap.isOpened() and not self.stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -179,16 +206,17 @@ class FaceRecognitionSystem:
                         cv2.putText(frame, names[i], (x1, y1 - 30), cv2.FONT_HERSHEY_COMPLEX, self.font_scale, self.color["green"], self.thickness)
 
                 t1 = time.time()
-                results = face_detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame))
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                results = face_detector.detect_for_video(mp_image, time.monotonic_ns() // 1_000_000)
                 if print_logs:
                     logger_.info(f"Face detection time: {(time.time() - t1):.3f} sec")
 
                 if results.detections:
                     for i, detection in enumerate(results.detections):
                         score = detection.categories[0].score
-                        bounding_box = detection.bounding_box
-                        x1, y1 = bounding_box.origin_x, bounding_box.origin_y
-                        x2, y2 = x1 + bounding_box.width, y1 + bounding_box.height
+                        bbox = detection.bounding_box
+                        x1, y1 = bbox.origin_x, bbox.origin_y
+                        x2, y2 = x1 + bbox.width, y1 + bbox.height
                         facelocations.append([y1, x2, y2, x1])
 
                         cv2.rectangle(frame, (x1, y1), (x2, y2), self.color["green"], 1)
@@ -220,11 +248,15 @@ class FaceRecognitionSystem:
                     y_axis = min(self.max_y, max(self.min_y, y_axis))
                     px, py = x_axis, y_axis
                     # self.arduino_controller.servo_move(x_axis, y_axis, p=0.8, print_logs=False)
-                    if flip:
-                        recv = self.arduino_controller.send_payload(X1=self.max_x - x_axis, Y2=self.max_y - y_axis, AUX6=1)
+                    target_x = self.max_x - x_axis if flip else x_axis
+                    target_y = self.max_y - y_axis
+                    if camera_control_queue is not None:
+                        self._send_camera_target(camera_control_queue, target_x, target_y)
+                        recv = None
                     else:
-                        recv = self.arduino_controller.send_payload(X1=x_axis, Y2=self.max_y - y_axis, AUX6=1)
-                    print(recv)
+                        recv = self.arduino_controller.send_payload(X1=target_x, Y2=target_y, AUX6=1)
+                    if recv:
+                        print(recv)
                     if score > 0.63:
                         kx = 0 if diff_x > 0 else 1
                         ky = 1 if diff_y > 0 else 0
@@ -267,10 +299,12 @@ class FaceRecognitionSystem:
                     y_axis = min(self.max_y, max(self.min_y, y_axis))
                     px, py = x_axis, y_axis
                     # self.arduino_controller.servo_move(x_axis, y_axis, p=1, print_logs=False)
-                    if flip:
-                        self.arduino_controller.send_payload(X1=self.max_x - x_axis, Y2=self.max_y - y_axis, AUX6=1)
+                    target_x = self.max_x - x_axis if flip else x_axis
+                    target_y = self.max_y - y_axis
+                    if camera_control_queue is not None:
+                        self._send_camera_target(camera_control_queue, target_x, target_y)
                     else:
-                        self.arduino_controller.send_payload(X1=x_axis, Y2=self.max_y - y_axis, AUX6=1)
+                        self.arduino_controller.send_payload(X1=target_x, Y2=target_y, AUX6=1)
 
                 if not self.current_frame_queue.empty():
                     self.current_frame_queue.get_nowait()  # Remove the old frame
@@ -289,24 +323,24 @@ class FaceRecognitionSystem:
         except Exception as e:
             logger_.error(f"Face detection error: {e}")
         finally:
-            if face_detector is not None:
-                face_detector.close()
+            self.stop_event.set()
+            face_detector.close()
             cap.release()
             cv2.destroyAllWindows()
-            self.stop()
 
     def get_current_image(self):
         if not self.current_frame_queue.empty():
             return self.current_frame_queue.get()
 
-    def run(self, in_background: bool = False, cap: cv2.VideoCapture = None):
+    def run(self, in_background: bool = False, cap: cv2.VideoCapture = None, camera_control_queue=None):
         if not self.is_running:
             self.is_running = True
             self.stop_event.clear()
+            self._clear_camera_targets()
             try:
                 if in_background:
                     if self.detection_process is None:
-                        self.detection_process = multiprocessing.Process(target=self.face_detection, args=(cap,))
+                        self.detection_process = multiprocessing.Process(target=self.face_detection, args=(cap, camera_control_queue))
                     if not self.detection_process.is_alive():
                         self.detection_process.start()
 
@@ -316,7 +350,7 @@ class FaceRecognitionSystem:
                     self.recognition_process.start()
 
                 if not in_background:
-                    self.face_detection(cap=cap)
+                    self.face_detection(cap=cap, camera_control_queue=camera_control_queue)
                     self.detection_queue.put(None)
                     self.stop_event.set()
                     self.stop()
@@ -341,32 +375,44 @@ class FaceRecognitionSystem:
             if self.recognition_process is not None and self.recognition_process.is_alive():
                 logger_.info("Stopping face recognition process...")
                 try:
-                    self.recognition_process.join()
+                    self.recognition_process.join(timeout=2)
+                    if self.recognition_process.is_alive():
+                        self.recognition_process.terminate()
+                        self.recognition_process.join(timeout=2)
                 except Exception:
                     if self.recognition_process.is_alive():
                         self.recognition_process.terminate()
-                        self.recognition_process.join()
+                        self.recognition_process.join(timeout=2)
                     # self.recognition_process = None
 
             # Stop and clean up the detection process
             if self.detection_process is not None and self.detection_process.is_alive():
                 logger_.info("Stopping face detection process...")
                 try:
-                    self.detection_process.join()
+                    self.detection_process.join(timeout=2)
+                    if self.detection_process.is_alive():
+                        self.detection_process.terminate()
+                        self.detection_process.join(timeout=2)
                 except Exception:
                     if self.detection_process.is_alive():
                         self.detection_process.terminate()  # Force terminate if needed
-                        self.detection_process.join()  # Wait for it to finish
+                        self.detection_process.join(timeout=2)  # Wait for it to finish
                     # self.detection_process = None
 
             # Close and join queues
             for name, q in self.queues.items():
                 try:
                     if q:
+                        # Workers may have been terminated with buffered data. Waiting for
+                        # their feeder threads here can block Jarvis forever.
+                        q.cancel_join_thread()
                         q.close()
-                        q.join_thread()
                 except Exception as e:
                     logger_.error(f"Failed to close {name}: {e}")
+
+            self.recognition_process = None
+            self.detection_process = None
+            self._create_worker_queues()
 
         except Exception as e:
             logger_.error(f"Error while stopping face recognition processes: {e}")

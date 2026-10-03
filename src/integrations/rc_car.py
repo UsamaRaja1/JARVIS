@@ -1,6 +1,7 @@
 import re
 import threading
 import time
+from queue import Empty
 
 import cv2
 import numpy as np
@@ -22,16 +23,24 @@ class RCCarController:
         self.cap = None
         self.front_light = 0
         self.toggle_time = time.time()
-        self.listener = self._start_keyboard_listener()
-        self.is_running = True
+        self.listener = None
+        self.is_running = False
         self.latest_response = {}
         self.response_lock = threading.Lock()
         self.response_event = threading.Event()
-        self.running = True
+        self._send_lock = threading.Lock()
+        self._transport_running = threading.Event()
+        self._controls_running = threading.Event()
+        self.serial_thread = None
+        self.control_thread = None
+        self.camera_target_queue = None
+        self.camera_tracking = False
+        self._control_stop_event = None
 
         # Piggybacked text command sent on the next control frames
         # (e.g. "ip", "status"). Cleared by whoever set it once a reply arrives.
         self._request_text = ""
+        self._cam_x = 127
         self._cam_y = 127
 
         # Clear any stale bytes that may have been buffered between runs.
@@ -41,18 +50,42 @@ class RCCarController:
             except Exception as e:
                 logger_.warning("reset_input_buffer failed: %s", e)
 
+    def _start_transport(self):
+        """Start telemetry without enabling keyboard or driving controls."""
+        if self.serial_thread and self.serial_thread.is_alive():
+            return
+        self._transport_running.set()
         self.serial_thread = threading.Thread(target=self._serial_reader, daemon=True)
-        self.control_thread = threading.Thread(target=self._control_loop, daemon=True)
-
         self.serial_thread.start()
+
+    def start_controls(self, camera_target_queue=None, keyboard_control: bool = True, stop_event=None):
+        """Start the single RC output loop and, optionally, keyboard input."""
+        if camera_target_queue is not None:
+            self.camera_target_queue = camera_target_queue
+            self.camera_tracking = True
+        self._control_stop_event = stop_event
+        if self._controls_running.is_set():
+            return
+
+        self._start_transport()
+        if keyboard_control:
+            self.listener = self._start_keyboard_listener()
+        self._controls_running.set()
+        self.is_running = True
+        self.control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self.control_thread.start()
+
+    def set_camera_tracking(self, enabled: bool, camera_target_queue=None):
+        if camera_target_queue is not None:
+            self.camera_target_queue = camera_target_queue
+        self.camera_tracking = enabled
 
     # -------------------------
     # SERIAL READER THREAD
     # -------------------------
     def _serial_reader(self):
         """Parse 'T,<ping>,<pwm>,<message>\\n' telemetry frames from the sketch."""
-        while self.running:
+        while self._transport_running.is_set():
             try:
                 ser = self.arduino.arduino_serial
                 if not ser:
@@ -94,24 +127,39 @@ class RCCarController:
     def _control_loop(self):
         last_send = 0
 
-        while self.running:
-            if time.time() - last_send >= 0.02:  # 50 Hz
-                last_send = time.time()
+        try:
+            while self._controls_running.is_set() and not (self._control_stop_event and self._control_stop_event.is_set()):
+                if time.time() - last_send >= 0.02:  # 50 Hz
+                    last_send = time.time()
 
-                control_data = self._get_control_values()
+                    control_data = self._get_control_values()
 
-                try:
-                    self.arduino.send_payload(**control_data)
-                except Exception as e:
-                    logger_.error("Send error:", e)
+                    try:
+                        self._send_payload(**control_data)
+                    except Exception as e:
+                        logger_.error("Send error: %s", e)
 
-            time.sleep(0.001)
+                time.sleep(0.001)
+        finally:
+            self._controls_running.clear()
+            self.is_running = False
+            if self.listener:
+                self.listener.stop()
+                self.listener = None
+            try:
+                self._send_payload()
+            except Exception as e:
+                logger_.warning("Failed to send neutral controls: %s", e)
 
     def _start_keyboard_listener(self):
         listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
         listener.daemon = True
         listener.start()
         return listener
+
+    def _send_payload(self, **control_data):
+        with self._send_lock:
+            return self.arduino.send_payload(**control_data)
 
     def _on_press(self, key):
         try:
@@ -138,10 +186,14 @@ class RCCarController:
         valid IPv4 message. Avoids racing the reader thread on the serial port.
         """
         logger_.info("Getting IP address...")
+        self._start_transport()
         self._request_text = "ip"
         deadline = time.time() + timeout
         try:
             while time.time() < deadline:
+                # Camera discovery needs control frames, but not the persistent
+                # driving loop or a global keyboard hook.
+                self._send_payload(text="ip")
                 self.response_event.wait(timeout=0.2)
                 self.response_event.clear()
                 with self.response_lock:
@@ -161,6 +213,8 @@ class RCCarController:
             self.cap = cv2.VideoCapture(stream_url)
             if not self.cap.isOpened():
                 logger_.info("Error: Cannot open video stream")
+                self.cap.release()
+                self.cap = None
                 return None
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             return self.cap
@@ -171,15 +225,16 @@ class RCCarController:
     def _get_control_values(self):
         speed = 220 if self.key_state["w"] else 30 if self.key_state["s"] else 127
         turn = 50 if self.key_state["a"] else 200 if self.key_state["d"] else 127
-        y = -10 if self.key_state["i"] else 10 if self.key_state["k"] else 0
-        x = 50 if self.key_state["j"] else 210 if self.key_state["l"] else 127
+        if self.camera_tracking:
+            self._consume_camera_target()
+            x = self._cam_x
+            y = self._cam_y
+        else:
+            y_step = -10 if self.key_state["i"] else 10 if self.key_state["k"] else 0
+            x = 50 if self.key_state["j"] else 210 if self.key_state["l"] else 127
+            y = min(255, max(0, self._cam_y + y_step))
+            self._cam_y = y
         aux2 = int(self.key_state["h"])
-        y = self._cam_y + y
-        if y < 0:
-            y = 0
-        elif y > 255:
-            y = 255
-        self._cam_y = y
 
         if self.key_state["f"] and (time.time() - self.toggle_time > 0.3):
             if self.front_light == 0:
@@ -197,12 +252,25 @@ class RCCarController:
             Y2=y,
             AUX4=1,
             AUX5=1,
+            AUX6=1,
             AUX2=aux2,
             AUX3=int(self.front_light),
             text=self._request_text,
         )
 
+    def _consume_camera_target(self):
+        if self.camera_target_queue is None:
+            return
+        try:
+            while True:
+                target = self.camera_target_queue.get_nowait()
+                self._cam_x = min(255, max(0, int(target[0])))
+                self._cam_y = min(255, max(0, int(target[1])))
+        except Empty:
+            pass
+
     def run(self):
+        self.start_controls()
         self.connect_camera()
         if not self.cap:
             logger_.info("No camera connected, continuing without it.")
@@ -214,7 +282,7 @@ class RCCarController:
         try:
             frame = np.zeros((480, 640, 3), np.uint8)
 
-            while self.running:
+            while self._controls_running.is_set():
                 if self.cap:
                     ret, new_frame = self.cap.read()
                     if not ret:
@@ -243,13 +311,35 @@ class RCCarController:
                 self.cap.release()
             cv2.destroyAllWindows()
 
-    def stop(self):
+    def stop_controls(self):
+        if not self._controls_running.is_set() and not self.listener:
+            return
+
+        self._controls_running.clear()
         self.is_running = False
-        self.running = False
-        self.response_event.set()  # unblock any waiters
-        self.listener.stop()
+        if self.listener:
+            self.listener.stop()
+            self.listener = None
+        if self.control_thread and self.control_thread.is_alive():
+            self.control_thread.join(timeout=1)
+        self.control_thread = None
+        self.key_state = {key: False for key in self.key_state}
+        # Leave the vehicle stopped even when the camera/telemetry transport stays open.
+        try:
+            self._send_payload()
+        except Exception as e:
+            logger_.warning("Failed to send neutral controls: %s", e)
+
+    def stop(self):
+        self.stop_controls()
+        self._transport_running.clear()
+        self.response_event.set()
+        if self.serial_thread and self.serial_thread.is_alive():
+            self.serial_thread.join(timeout=2)
+        self.serial_thread = None
         if self.cap:
             self.cap.release()
+            self.cap = None
 
 
 if __name__ == "__main__":

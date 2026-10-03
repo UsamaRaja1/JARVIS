@@ -18,12 +18,12 @@ async def greet_user():
 
 
 async def jarvis(arduino=None, face_recognizer=None):
+    rc_car = None
     try:
         arduino = arduino if arduino is not None else ArduinoController()
         face_recognizer = face_recognizer if face_recognizer else FaceRecognitionSystem(arduino)
         await greet_user()
         t = time.time()
-        rc_car = None
         prev_query = ""
         timer = time.time()
 
@@ -37,11 +37,11 @@ async def jarvis(arduino=None, face_recognizer=None):
                 await asyncio.sleep(0.1)
                 continue
 
-            if assistant.speech_committed:
+            if utterance := assistant.get_committed_utterance():
                 callback = False
                 repeat_speech = False
-                await assistant.transcribe_audio(callback, repeat_speech, assistant.offline_stt)
-                assistant.speech_committed = False
+                audio_data, user_name = utterance
+                await assistant.transcribe_audio(callback, repeat_speech, assistant.offline_stt, audio_data=audio_data, user_name=user_name)
 
             query = assistant.text
             name = name if (name := assistant.user_name) else USER_NAME
@@ -63,6 +63,7 @@ async def jarvis(arduino=None, face_recognizer=None):
             # Perform Actions based on User Input
             if assistant.new_speech:
                 assistant.new_speech = False
+                command = query.strip().lower()
 
                 if BOT_NAME.lower() in query or time.time() - t < FOLLOW_UP_WINDOW_SECONDS:
                     t = time.time()
@@ -73,25 +74,49 @@ async def jarvis(arduino=None, face_recognizer=None):
                         await asyncio.sleep(1)
                         break
 
-                    elif ("turn on" in query or "activate" in query.split()) and ("camera" in query or "detect" in query):
+                    elif ("wifi" in command or "wi-fi" in command) and "camera" in command and any(action in command for action in ("disconnect", "stop", "turn off", "deactivate")):
+                        await asyncio.to_thread(face_recognizer.stop)
+                        if rc_car:
+                            rc_car.stop()
+                            rc_car = None
+                        assistant.say("WiFi camera and car controls stopped.")
+
+                    elif ("wifi" in command or "wi-fi" in command) and "camera" in command and any(action in command for action in ("connect", "start", "turn on", "activate")):
+                        if rc_car:
+                            assistant.say("The WiFi camera is already connected.")
+                            continue
+
+                        rc_car = RCCarController(arduino)
+                        cap = await asyncio.to_thread(rc_car.connect_camera)
+
+                        if cap:
+                            face_recognizer.run(True, cap=cap, camera_control_queue=face_recognizer.camera_control_queue)
+                            if face_recognizer.is_running:
+                                rc_car.start_controls(camera_target_queue=face_recognizer.camera_control_queue, stop_event=face_recognizer.stop_event)
+                                assistant.say("WiFi camera connected. Face tracking and car controls are active.")
+                            else:
+                                rc_car.stop()
+                                rc_car = None
+                                assistant.say("The camera connected, but face tracking failed to start.")
+                        else:
+                            rc_car.stop()
+                            rc_car = None
+                            assistant.say("Failed to connect to WiFi camera.")
+
+                    elif ("turn on" in command or "activate" in command.split()) and ("camera" in command or "detect" in command):
                         face_recognizer.run(True)
                         assistant.say("Turning on camera.")
 
-                    elif ("connect" in query and "wifi" in query) or "camera" in query:
+                    elif ("turn off" in command or "deactivate" in command or "stop detection" in command or "stop face recognition" in command) and (
+                        "camera" in command or "detect" in command or "face recognition" in command
+                    ):
+                        await asyncio.to_thread(face_recognizer.stop)
                         if not rc_car:
-                            rc_car = RCCarController(arduino)
-
-                        cap = rc_car.connect_camera()
-
-                        if cap:
-                            face_recognizer.run(True, cap=cap)
-                            assistant.say("Connecting WiFi camera.")
+                            assistant.say("Face recognition stopped.")
                         else:
-                            assistant.say("Failed to connect to WiFi camera.")
-
-                    elif ("turn off" in query or "deactivate" in query) and ("camera" in query or "detect" in query):
-                        face_recognizer.stop()
-                        assistant.say("Turning off camera.")
+                            rc_car.stop()
+                            rc_car = None
+                            assistant.say("Face recognition, WiFi camera, and car controls stopped.")
 
                     elif "go to" in query and "sleep" in query:
                         t = time.time() - FOLLOW_UP_WINDOW_SECONDS - 10
@@ -110,7 +135,9 @@ async def jarvis(arduino=None, face_recognizer=None):
         logger_.error(f"Error in jarvis: {e}")
         assistant.say("An unexpected error occurred. I'm shutting down now.")
     finally:
-        face_recognizer.stop()
+        await asyncio.to_thread(face_recognizer.stop)
+        if rc_car:
+            rc_car.stop()
         assistant.stop_listener()
 
 
