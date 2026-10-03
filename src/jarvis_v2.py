@@ -69,19 +69,21 @@ async def jarvis(arduino=None, face_recognizer=None):
                     t = time.time()
 
                     if ("bye" in query and BOT_NAME.lower() in query) or "terminate" in query:
-                        response = f"Understood. Shutting down. Goodbye, {USER_NAME}."
+                        response = f"Understood. Shutting down. Goodbye {USER_NAME}."
                         assistant.say(response)
                         await asyncio.sleep(1)
                         break
 
-                    elif ("wifi" in command or "wi-fi" in command) and "camera" in command and any(action in command for action in ("disconnect", "stop", "turn off", "deactivate")):
+                    elif ((("wifi" in command or "wi-fi" in command) and "camera" in command) or "car" in command) and any(
+                        action in command for action in ("disconnect", "stop", "turn off", "deactivate")
+                    ):
                         await asyncio.to_thread(face_recognizer.stop)
                         if rc_car:
                             rc_car.stop()
                             rc_car = None
                         assistant.say("WiFi camera and car controls stopped.")
 
-                    elif ("wifi" in command or "wi-fi" in command) and "camera" in command and any(action in command for action in ("connect", "start", "turn on", "activate")):
+                    elif ((("wifi" in command or "wi-fi" in command) and "camera" in command) or "car" in command) and any(action in command for action in ("connect", "start", "turn on", "activate")):
                         if rc_car:
                             assistant.say("The WiFi camera is already connected.")
                             continue

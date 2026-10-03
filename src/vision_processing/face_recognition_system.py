@@ -169,9 +169,9 @@ class FaceRecognitionSystem:
         names = []
         flip = False
         scan_positions = (
-            (127, 80),
-            (75, 80),
-            (180, 80),
+            (127, 90),
+            (75, 90),
+            (180, 90),
             (127, 120),
             (75, 120),
             (180, 120),
@@ -284,7 +284,7 @@ class FaceRecognitionSystem:
                         scan_hold_until = 0.0
                         was_tracking = False
                     target_x, target_y = scan_positions[scan_index]
-                    print(target_x, target_y)
+                    # print(target_x, target_y)
                     x_axis = self._move_toward(x_axis, target_x)
                     y_axis = self._move_toward(y_axis, target_y)
                     if (x_axis, y_axis) == (target_x, target_y):
