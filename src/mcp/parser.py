@@ -1,9 +1,12 @@
 import json
 import re
+from collections import deque
 from typing import Any
 
 from src.llm.chat_ai import chat_ai
 from src.utilz.logger import logger_
+
+_command_history: deque[str] = deque(maxlen=3)
 
 DESKTOP_INTENT_PROMPT = """
 You convert desktop-assistant voice commands into MCP tool calls.
@@ -23,6 +26,7 @@ or:
 
 Rules:
 - Choose the single best tool unless the command explicitly requires multiple steps.
+- Use recent commands only to resolve references like `it`, `that`, or omitted names.
 - Use `search_web` for web searches. If no provider is named, default to `google`.
 - Use `open_app` for opening an installed application like chrome, slack, pycharm, or terminal.
 - Use `focus_app` for focusing an already-running application or window.
@@ -58,6 +62,7 @@ or:
 Rules:
 - Choose the best matching tool.
 - Extract arguments clearly.
+- Use recent commands only to resolve references like `it`, `that`, or omitted device names.
 - If no tool fits, return:
   [{"tool":"none","arguments":{}}]
 - No prose. No markdown fences.
@@ -92,7 +97,11 @@ def _parse_json_response(text: str) -> dict[str, Any] | list[dict[str, Any]]:
 async def parse_intent(command: str, tools: list, hint: str | None = None):
     prompt = DESKTOP_INTENT_PROMPT if hint == "desktop" else GENERAL_INTENT_PROMPT
     system_prompt = f"{prompt}\nAvailable tools:\n{tools}"
-    response = await chat_ai.chat(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": command}])
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend({"role": "user", "content": previous_command} for previous_command in _command_history)
+    messages.append({"role": "user", "content": command})
+    _command_history.append(command)
+    response = await chat_ai.chat(messages=messages)
     content = response.get("content", "")
     try:
         return _parse_json_response(content)
