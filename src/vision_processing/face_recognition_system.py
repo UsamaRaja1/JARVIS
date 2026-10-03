@@ -1,16 +1,37 @@
 import multiprocessing
+import os
 import time
+from pathlib import Path
+from urllib.request import urlretrieve
 
 import cv2
 import face_recognition as fr
 import mediapipe as mp
 
-from src.configs import IMAGE_ENCODING_DIR, IMAGE_SAMPLE_DIR
+from src.configs import DATA_DIR, IMAGE_ENCODING_DIR, IMAGE_SAMPLE_DIR
 from src.integrations.arduino_controller import ArduinoController
 from src.integrations.rc_car import RCCarController
 from src.modules.video_capture import get_video_capture
 from src.utilz.logger import logger_
 from src.utilz.modules import encode_images, load_images
+
+FACE_DETECTOR_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
+
+
+def get_face_detector_model_path():
+    model_path = Path(os.getenv("FACE_DETECTOR_MODEL_PATH", Path(DATA_DIR) / "models" / "blaze_face_short_range.tflite"))
+    if model_path.is_file():
+        return str(model_path)
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = model_path.with_suffix(".tmp")
+    logger_.info(f"Downloading MediaPipe face detector model to: {model_path}")
+    try:
+        urlretrieve(FACE_DETECTOR_MODEL_URL, temporary_path)
+        temporary_path.replace(model_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return str(model_path)
 
 
 class FaceRecognitionSystem:
@@ -106,9 +127,6 @@ class FaceRecognitionSystem:
         x_axis, y_axis = 127, 127
         px, py = x_axis, y_axis
 
-        mp_face_detection = mp.solutions.face_detection
-        face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.5)
-
         prev_time = time.time()
         print_logs = False
         kx = 0
@@ -119,8 +137,15 @@ class FaceRecognitionSystem:
 
         recognition_queue = self.queues["recognition_queue"]
         detection_queue = self.queues["detection_queue"]
+        face_detector = None
 
         try:
+            options = mp.tasks.vision.FaceDetectorOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=get_face_detector_model_path()),
+                min_detection_confidence=0.5,
+            )
+            face_detector = mp.tasks.vision.FaceDetector.create_from_options(options)
+
             while cap.isOpened() or self.stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
@@ -154,17 +179,16 @@ class FaceRecognitionSystem:
                         cv2.putText(frame, names[i], (x1, y1 - 30), cv2.FONT_HERSHEY_COMPLEX, self.font_scale, self.color["green"], self.thickness)
 
                 t1 = time.time()
-                results = face_detection.process(rgb_frame)
+                results = face_detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame))
                 if print_logs:
                     logger_.info(f"Face detection time: {(time.time() - t1):.3f} sec")
 
                 if results.detections:
                     for i, detection in enumerate(results.detections):
-                        data = str(detection).split("\n")
-                        score = float(data[1].split(":")[1])
-                        bboxC = detection.location_data.relative_bounding_box
-                        x1, y1 = int(bboxC.xmin * frame_width), int(bboxC.ymin * frame_height)
-                        x2, y2 = x1 + int(bboxC.width * frame_width), y1 + int(bboxC.height * frame_height)
+                        score = detection.categories[0].score
+                        bounding_box = detection.bounding_box
+                        x1, y1 = bounding_box.origin_x, bounding_box.origin_y
+                        x2, y2 = x1 + bounding_box.width, y1 + bounding_box.height
                         facelocations.append([y1, x2, y2, x1])
 
                         cv2.rectangle(frame, (x1, y1), (x2, y2), self.color["green"], 1)
@@ -265,6 +289,8 @@ class FaceRecognitionSystem:
         except Exception as e:
             logger_.error(f"Face detection error: {e}")
         finally:
+            if face_detector is not None:
+                face_detector.close()
             cap.release()
             cv2.destroyAllWindows()
             self.stop()

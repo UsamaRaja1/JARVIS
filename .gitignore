@@ -175,6 +175,7 @@ src/data/images-samples/*
 !src/data/images-samples/README.md
 !src/data/images-samples/AlexExample.jpg
 src/data/images-encodings/*
+src/data/models/
 notebook/*.mp3
 notebook/*.wav
 notebook/*.json
